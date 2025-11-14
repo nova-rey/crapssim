@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import random
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
+from typing_extensions import Literal
 
 try:
     from fastapi import APIRouter, FastAPI, Body
@@ -64,6 +65,64 @@ from crapssim.bet import _compute_vig, _vig_policy
 
 class RollRequest(BaseModel):
     dice: list[int] | None = None
+
+
+class SessionStartBody(BaseModel):
+    seed: Optional[int] = None
+    profile: Optional[str] = None
+    spec: Optional[Dict[str, Any]] = None
+
+    def to_request_payload(self) -> StartSessionRequest:
+        spec: Dict[str, Any]
+        if isinstance(self.spec, dict):
+            spec = dict(self.spec)
+        else:
+            spec = {}
+
+        if self.profile:
+            spec = dict(spec)
+            spec["table_profile"] = self.profile
+
+        seed_value = int(self.seed) if isinstance(self.seed, int) else 0
+        return {"spec": spec, "seed": seed_value}
+
+
+class SessionActionBet(BaseModel):
+    type: str
+    amount: float
+
+
+class SessionActionRequest(BaseModel):
+    session_id: str
+    action: Literal["place"]
+    bets: List[SessionActionBet]
+
+
+class SessionRollBody(BaseModel):
+    session_id: Optional[str] = None
+    mode: Literal["auto", "inject"] = "auto"
+    dice: list[int] | None = None
+
+
+def _translate_session_bet(bet: SessionActionBet) -> tuple[str, Dict[str, Any]]:
+    bet_type = bet.type
+    amount_value = bet.amount
+    if not isinstance(bet_type, str) or not bet_type:
+        raise bad_args("bet type must be a non-empty string")
+    if not isinstance(amount_value, (int, float)) or amount_value <= 0:
+        raise bad_args("bet amount must be positive")
+
+    if bet_type == "pass_line":
+        return "pass_line", {"amount": float(amount_value)}
+
+    if bet_type.startswith("place_"):
+        try:
+            box = int(bet_type.split("_", 1)[1])
+        except (IndexError, ValueError):
+            raise bad_args(f"unrecognized place bet '{bet_type}'")
+        return "place", {"amount": float(amount_value), "box": box}
+
+    raise unsupported_bet(f"bet type '{bet_type}' is not supported")
 
 from .actions import VerbRegistry
 from .actions import (
@@ -339,7 +398,6 @@ if router is not None:  # pragma: no cover - FastAPI optional
     def _start_session_http(body: StartSessionRequest = Body(...)) -> Response:
         return _json_response(start_session(body))
 
-    router.post("/session/start")(_start_session_http)
     router.post("/start_session")(_start_session_http)
 
 
@@ -602,36 +660,90 @@ if router is not None:  # pragma: no cover - FastAPI optional
 
 # Optional FastAPI-based session endpoints
 
-session = None
+_legacy_session: Session | None = None
+
+
+def _legacy_session_start() -> Dict[str, Any]:
+    global _legacy_session
+    _legacy_session = Session()
+    _legacy_session.start()
+    return {"ok": True}
+
+
+def _legacy_session_stop() -> Dict[str, Any]:
+    if _legacy_session:
+        _legacy_session.stop()
+    return {"ok": True}
+
+
+def _legacy_session_roll(dice: list[int] | None) -> Dict[str, Any]:
+    if not _legacy_session:
+        return {"ok": False, "error": "NO_SESSION"}
+    evt = _legacy_session.step_roll(dice=dice)
+    return {"ok": True, "event": evt}
+
+
+def _legacy_session_state() -> Dict[str, Any]:
+    if not _legacy_session:
+        return {"ok": False, "error": "NO_SESSION"}
+    return {"ok": True, "state": _legacy_session.snapshot()}
+
 
 if FastAPI is not None:
 
     @router.post("/session/start")
-    def start_session():
-        global session
-        session = Session()
-        session.start()
-        return {"ok": True}
+    def session_start(body: SessionStartBody | None = Body(default=None)):
+        if body is None or (body.seed is None and body.profile is None and body.spec is None):
+            return _legacy_session_start()
+        payload = body.to_request_payload()
+        result = start_session(payload)
+        return dict(result)
 
-    @router.post("/session/stop")
-    def stop_session():
-        if session:
-            session.stop()
-        return {"ok": True}
+    @router.post("/session/action")
+    def session_action(body: SessionActionRequest):
+        if body.action != "place":
+            raise bad_args("only 'place' action is supported")
+
+        results: List[Dict[str, Any]] = []
+        last_snapshot: Optional[Dict[str, Any]] = None
+
+        for bet in body.bets:
+            verb, args = _translate_session_bet(bet)
+            sess = SESSION_STORE.ensure(body.session_id)
+            hand = sess["hand"]
+            state = {"puck": hand.puck, "point": hand.point}
+            action_result = apply_action(
+                {"session_id": body.session_id, "verb": verb, "args": args, "state": state}
+            )
+            results.append(action_result.get("effect_summary", {}))
+            last_snapshot = action_result.get("snapshot")
+
+        response: Dict[str, Any] = {"results": results}
+        if last_snapshot is not None:
+            response["snapshot"] = last_snapshot
+        return response
 
     @router.post("/session/roll")
-    def roll(payload: RollRequest | None = Body(default=None)):
-        if not session:
-            return {"ok": False, "error":"NO_SESSION"}
-        dice = payload.dice if payload is not None else None
-        evt = session.step_roll(dice=dice)
-        return {"ok": True, "event": evt}
+    def session_roll(body: SessionRollBody | RollRequest | None = Body(default=None)):
+        if isinstance(body, SessionRollBody) and body.session_id:
+            step_req = StepRollRequest(session_id=body.session_id, mode=body.mode, dice=body.dice)
+            snapshot = step_roll(step_req)
+            return {"snapshot": snapshot}
+
+        dice_values: list[int] | None = None
+        if isinstance(body, SessionRollBody):
+            dice_values = body.dice
+        elif isinstance(body, RollRequest):
+            dice_values = body.dice
+        return _legacy_session_roll(dice_values)
+
+    @router.post("/session/stop")
+    def session_stop():
+        return _legacy_session_stop()
 
     @router.get("/session/state")
-    def state():
-        if not session:
-            return {"ok": False, "error":"NO_SESSION"}
-        return {"ok": True, "state": session.snapshot()}
+    def session_state():
+        return _legacy_session_state()
 
 
 try:  # pragma: no cover - FastAPI optional
